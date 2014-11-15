@@ -1,5 +1,6 @@
 #include        <stdio.h>
 #include        <fcntl.h>
+#include        <string.h>
 #include        <sys/types.h>
 #include        <sys/mman.h>
 
@@ -11,6 +12,7 @@ void main()
   unsigned char* buf;
   unsigned int   buf_size;
   unsigned long  phys_addr;
+  unsigned long  debug_vma = 0;
 
   fd  = open("/sys/class/cmabuf/cmabuf0/phys_addr", O_RDONLY);
   read(fd, attr, 1024);
@@ -23,8 +25,8 @@ void main()
   close(fd);
 
   fd  = open("/sys/class/cmabuf/cmabuf0/debug_vma", O_WRONLY);
-  read(fd, attr, 1024);
-  sscanf(attr, "%d", &buf_size);
+  sprintf(attr, "%d", debug_vma);
+  write(fd, attr, strlen(attr));
   close(fd);
 
   printf("phys_addr=0x%x\n", phys_addr);
