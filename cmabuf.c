@@ -68,7 +68,6 @@
 
 static struct class*  cmabuf_sys_class     = NULL;
 static dev_t          cmabuf_device_number = 0;
-static int            cmabuf_device_count  = 0;
 
 /**
  * struct cmabuf_driver_data - Device driver structure
@@ -261,6 +260,39 @@ static const struct file_operations cmabuf_driver_file_ops = {
     .mmap    = cmabuf_driver_file_mmap,
 };
 
+
+/**
+ * cmabuf_device_minor_number_bitmap
+ */
+static u32  cmabuf_device_minor_number_bitmap = 0;
+static int  cmabuf_device_minor_number_check(int num)
+{
+    if (num >= 32) {
+        return 0;
+    } else {
+        u32 mask = (1 << num);
+        if (cmabuf_device_minor_number_bitmap & mask)
+            return 0;
+        else 
+            return 1;
+    }
+}
+static int  cmabuf_device_minor_number_allocate(int num)
+{
+    if (cmabuf_device_minor_number_check(num) == 0) {
+        return -1;
+    } else {
+        u32 mask = (1 << num);
+        cmabuf_device_minor_number_bitmap |= mask;
+        return 0;
+    }
+}
+static void cmabuf_device_minor_number_free(int num)
+{
+    u32 mask = (1 << num);
+    cmabuf_device_minor_number_bitmap &= ~mask;
+}
+
 /**
  * cmabuf_driver_create() -  Create call for the device.
  *
@@ -277,6 +309,12 @@ static struct cmabuf_driver_data* cmabuf_driver_create(int minor, unsigned int s
     const unsigned int          DONE_CHRDEV_ADD    = (1 << 0);
     const unsigned int          DONE_ALLOC_CMA     = (1 << 1);
     const unsigned int          DONE_DEVICE_CREATE = (1 << 2);
+    /*
+     * alloc device_minor_number
+     */
+    if (cmabuf_device_minor_number_allocate(minor) == -1) {
+        goto failed;
+    }
     /*
      * create (cmabuf_driver_data*) this.
      */
@@ -369,6 +407,7 @@ static int cmabuf_driver_destroy(struct cmabuf_driver_data* this)
     if (!this)
         return -ENODEV;
 
+    cmabuf_device_minor_number_free(MINOR(this->device_number));
     dev_info(this->device, "driver uninstalled\n");
     dma_free_coherent(this->device, this->size, this->virt_addr, this->phys_addr);
     device_destroy(cmabuf_sys_class, this->device_number);
@@ -389,32 +428,49 @@ static int cmabuf_platform_driver_probe(struct platform_device *pdev)
 {
     int          retval = 0;
     unsigned int size   = 0;
+    unsigned int minor_number = 0;
 
     dev_info(&pdev->dev, "driver probe start.\n");
     /*
-     * get register resouce and ioremap to this->regs_addr.
+     * get buffer size
      */
     {
-        struct resource* res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-        if (res == NULL) {
-            dev_err(&pdev->dev, "invalid register resouce\n");
+        int status;
+        status = of_property_read_u32(pdev->dev.of_node, "size", &size);
+        if (status != 0) {
+            dev_err(&pdev->dev, "invalid property size.\n");
             retval = -ENODEV;
             goto failed;
         }
-        size = res->end - res->start + 1;
+    }
+    /*
+     * get device number
+     */
+    {
+        int status;
+        status = of_property_read_u32(pdev->dev.of_node, "minor-number", &minor_number);
+        if (status != 0) {
+            dev_err(&pdev->dev, "invalid property minor number.\n");
+            retval = -ENODEV;
+            goto failed;
+        }
+        if (cmabuf_device_minor_number_check(minor_number) == 0) {
+            dev_err(&pdev->dev, "invalid or conflict minor number %d.\n", minor_number);
+            retval = -ENODEV;
+            goto failed;
+        }
     }
     /*
      * create (cmabuf_driver_data*)this.
      */
     {
-        struct cmabuf_driver_data* driver_data = cmabuf_driver_create(cmabuf_device_count, size);
+        struct cmabuf_driver_data* driver_data = cmabuf_driver_create(minor_number, size);
         if (IS_ERR_OR_NULL(driver_data)) {
             dev_err(&pdev->dev, "driver create fail.\n");
             retval = PTR_ERR(driver_data);
             goto failed;
         }
         dev_set_drvdata(&pdev->dev, driver_data);
-        cmabuf_device_count++;
     }
     dev_info(&pdev->dev, "driver installed.\n");
     return 0;
@@ -490,8 +546,6 @@ struct cmabuf_driver_data* cmabuf_driver[4] = {NULL,NULL,NULL,NULL};
         if (IS_ERR_OR_NULL(cmabuf_driver[__num])) {                                       \
             cmabuf_driver[__num] = NULL;                                                  \
             printk(KERN_ERR "%s: couldn't create cmabuf%d driver\n", DRIVER_NAME, __num); \
-        } else {                                                                          \
-            cmabuf_device_count = __num + 1;                                              \
         }                                                                                 \
     }
 
