@@ -1,6 +1,6 @@
 /*********************************************************************************
  *
- *       Copyright (C) 2014-2015 Ichiro Kawazome
+ *       Copyright (C) 2014 Ichiro Kawazome
  *       All rights reserved.
  * 
  *       Redistribution and use in source and binary forms, with or without
@@ -81,6 +81,9 @@ struct cmabuf_driver_data {
     int                  size;
     void*                virt_addr;
     dma_addr_t           phys_addr;
+#if (CMABUF_DEBUG == 1)
+    bool                 debug_vma;
+#endif   
 };
 
 #define DEF_ATTR_SHOW(__attr_name, __format, __value) \
@@ -95,13 +98,102 @@ static ssize_t cmabuf_show_ ## __attr_name(struct device *dev, struct device_att
     return status;                                          \
 }
 
+#define DEF_ATTR_SET(__attr_name, __min, __max, __pre_action, __post_action) \
+static ssize_t cmabuf_set_ ## __attr_name(struct device *dev, struct device_attribute *attr, const char *buf, size_t size) \
+{ \
+    ssize_t       status; \
+    unsigned long value;  \
+    struct cmabuf_driver_data* this = dev_get_drvdata(dev);                  \
+    if (0 != mutex_lock_interruptible(&this->sem)){return -ERESTARTSYS;}     \
+    if (0 != (status = strict_strtoul(buf, 10, &value))) {     goto failed;} \
+    if ((value < __min) || (__max < value)) {status = -EINVAL; goto failed;} \
+    if (0 != (status = __pre_action )) {                       goto failed;} \
+    this->__attr_name = value;                                               \
+    if (0 != (status = __post_action)) {                       goto failed;} \
+    status = size;                                                           \
+  failed:                                                                    \
+    mutex_unlock(&this->sem);                                                \
+    return status;                                                           \
+}
+
 DEF_ATTR_SHOW(size      , "%d\n"   , this->size      );
 DEF_ATTR_SHOW(phys_addr , "0x%lx\n", this->phys_addr );
+#if (CMABUF_DEBUG == 1)
+DEF_ATTR_SHOW(debug_vma, "%d\n"    , this->debug_vma);
+DEF_ATTR_SET( debug_vma            , 0, 1, 0, 0);
+#endif
 
 static const struct device_attribute cmabuf_device_attrs[] = {
   __ATTR(size      , 0644, cmabuf_show_size      , NULL),
   __ATTR(phys_addr , 0644, cmabuf_show_phys_addr , NULL),
+#if (CMABUF_DEBUG == 1)
+  __ATTR(debug_vma , 0644, cmabuf_show_debug_vma , cmabuf_set_debug_vma),
+#endif
   __ATTR_NULL,
+};
+
+/**
+ * cmabuf_driver_vma_open() - The is the driver open function.
+ * @vma:        Pointer to the vm area structure.
+ * returns:	Success or error status.
+ */
+static void cmabuf_driver_vma_open(struct vm_area_struct* vma)
+{
+    struct cmabuf_driver_data* this = vma->vm_private_data;
+    if (CMABUF_DEBUG_CHECK(this, debug_vma))
+        dev_info(this->device, "vma_open(virt_addr=0x%lx, offset=0x%lx)\n", vma->vm_start, vma->vm_pgoff<<PAGE_SHIFT);
+}
+
+/**
+ * cmabuf_driver_vma_close() - The is the driver close function.
+ * @vma:        Pointer to the vm area structure.
+ * returns:	Success or error status.
+ */
+static void cmabuf_driver_vma_close(struct vm_area_struct* vma)
+{
+    struct cmabuf_driver_data* this = vma->vm_private_data;
+    if (CMABUF_DEBUG_CHECK(this, debug_vma))
+        dev_info(this->device, "vma_close()\n");
+}
+
+/**
+ * cmabuf_driver_vma_fault() - The is the driver nopage function.
+ * @vma:        Pointer to the vm area structure.
+ * @vfm:        Pointer to the vm fault structure.
+ * returns:	Success or error status.
+ */
+static int cmabuf_driver_vma_fault(struct vm_area_struct* vma, struct vm_fault* vmf)
+{
+    struct cmabuf_driver_data* this = vma->vm_private_data;
+    struct page*  page_ptr          = NULL;
+    unsigned long offset            = vmf->pgoff << PAGE_SHIFT;
+    unsigned long phys_addr         = this->phys_addr + offset;
+    unsigned long page_frame_num    = phys_addr  >> PAGE_SHIFT;
+    unsigned long request_size      = 1          << PAGE_SHIFT;
+    unsigned long available_size    = this->size  - offset;
+
+    if (CMABUF_DEBUG_CHECK(this, debug_vma))
+        dev_info(this->device, "vma_fault(virt_addr=0x%lx, phys_addr=0x%lx)\n", vmf->virtual_address, phys_addr);
+
+    if (request_size > available_size) 
+        return VM_FAULT_SIGBUS;
+
+    if (!pfn_valid(page_frame_num))
+        return VM_FAULT_SIGBUS;
+
+    page_ptr = pfn_to_page(page_frame_num);
+    get_page(page_ptr);
+    vmf->page = page_ptr;
+    return 0;
+}
+
+/**
+ *
+ */
+static const struct vm_operations_struct cmabuf_driver_vm_ops = {
+    .open    = cmabuf_driver_vma_open ,
+    .close   = cmabuf_driver_vma_close,
+    .fault   = cmabuf_driver_vma_fault,
 };
 
 /**
@@ -147,14 +239,15 @@ static int cmabuf_driver_file_mmap(struct file *file, struct vm_area_struct* vma
 {
     struct cmabuf_driver_data* this = file->private_data;
 
+    vma->vm_ops           = &cmabuf_driver_vm_ops;
     vma->vm_private_data  = this;
  /* vma->vm_flags        |= VM_RESERVED; */
     if (file->f_flags & O_SYNC) {
         vma->vm_flags    |= VM_IO;
         vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
     }
-    dev_info(this->device, "vm_page_prot = 0x%08X\n", vma->vm_page_prot);
-    return dma_mmap_coherent(this->device, vma, this->virt_addr, this->phys_addr, this->size);
+    cmabuf_driver_vma_open(vma);
+    return 0;
 }
 
 /**
